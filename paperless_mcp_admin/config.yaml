@@ -1,0 +1,26 @@
+name: Paperless MCP Admin
+version: "0.1.0"
+slug: paperless_mcp_admin
+description: Sichere administrative MCP-Schnittstelle für Paperless-ngx
+arch:
+  - amd64
+startup: services
+boot: auto
+init: false
+map:
+  - share:rw
+options:
+  paperless_url: "http://ca5234a0-paperless-ngx:8000"
+  paperless_token: ""
+  mcp_token: ""
+  read_only: true
+schema:
+  paperless_url: str
+  paperless_token: password
+  mcp_token: password
+  read_only: bool
+ports:
+  8770/tcp: 8770
+ports_description:
+  8770/tcp: MCP HTTP
+webui: "http://[HOST]:[PORT:8770]/mcp"
