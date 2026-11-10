@@ -1,5 +1,5 @@
 name: Paperless MCP Admin
-version: "0.1.0"
+version: "0.1.1"
 slug: paperless_mcp_admin
 description: Sichere administrative MCP-Schnittstelle für Paperless-ngx
 arch:
