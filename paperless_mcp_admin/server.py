@@ -216,4 +216,4 @@ async def paperless_admin_status() -> dict:
 
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=8770)
+    mcp.run(transport="streamable-http", host="0.0.0.0", port=8770, stateless_http=True)
