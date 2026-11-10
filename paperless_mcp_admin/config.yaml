@@ -1,5 +1,5 @@
 name: Paperless MCP Admin
-version: "0.1.1"
+version: "0.1.2"
 slug: paperless_mcp_admin
 description: Sichere administrative MCP-Schnittstelle für Paperless-ngx
 arch:
@@ -14,11 +14,21 @@ options:
   paperless_token: ""
   mcp_token: ""
   read_only: true
+  auth_mode: static
+  github_client_id: ""
+  github_client_secret: ""
+  github_allowed_user_id: "206956099"
+  oauth_signing_key: ""
 schema:
   paperless_url: str
   paperless_token: password
   mcp_token: password
   read_only: bool
+  auth_mode: list(static|github)
+  github_client_id: str
+  github_client_secret: password
+  github_allowed_user_id: str
+  oauth_signing_key: password
 ports:
   8770/tcp: 8770
 ports_description:
