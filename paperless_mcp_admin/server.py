@@ -1,6 +1,8 @@
 import base64
 import os
 from typing import Any
+from urllib.parse import urlsplit
+import re
 
 import httpx
 from fastmcp import FastMCP
@@ -23,6 +25,53 @@ ALLOWED_COLLECTIONS = {
     "groups", "correspondents",
 }
 
+def _allowed_chatgpt_redirect(uri: str) -> bool:
+    """Restrict all DCR clients to ChatGPT's documented HTTPS callbacks."""
+    try:
+        parsed = urlsplit(str(uri))
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname != "chatgpt.com"
+            or parsed.port not in (None, 443)
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query or parsed.fragment
+        ):
+            return False
+        if parsed.path == "/connector_platform_oauth_redirect":
+            return True
+        return bool(re.fullmatch(r"/connector/oauth/[A-Za-z0-9_-]{1,128}", parsed.path))
+    except ValueError:
+        return False
+
+
+class ChatGPTOnlyOAuthProxy(OAuthProxy):
+    """Fail closed on untrusted callbacks, including already registered clients.
+
+    FastMCP 2.14.x can accept disallowed redirects during DCR, so the
+    server validates them before registration and before authorization.
+    """
+
+    async def register_client(self, client_info):
+        redirect_uris = client_info.redirect_uris or []
+        if not redirect_uris or not all(
+            _allowed_chatgpt_redirect(str(uri)) for uri in redirect_uris
+        ):
+            raise ValueError("OAuth client redirect URI is not on the ChatGPT allowlist.")
+        return await super().register_client(client_info)
+
+    async def get_client(self, client_id):
+        client = await super().get_client(client_id)
+        if client is None:
+            return None
+        redirect_uris = client.redirect_uris or []
+        if not redirect_uris or not all(
+            _allowed_chatgpt_redirect(str(uri)) for uri in redirect_uris
+        ):
+            return None
+        return client
+
+
 AUTH_MODE = os.environ.get("AUTH_MODE", "static").strip().lower()
 GITHUB_ALLOWED_USER_ID = os.environ.get("GITHUB_ALLOWED_USER_ID", "").strip()
 
@@ -43,7 +92,7 @@ if AUTH_MODE == "github":
     signing_key = os.environ.get("OAUTH_SIGNING_KEY", "")
     if not client_id or not client_secret or len(signing_key) < 32 or not GITHUB_ALLOWED_USER_ID:
         raise SystemExit("GitHub OAuth requires client ID, client secret, signing key (32+ chars), and allowed user ID.")
-    auth = OAuthProxy(
+    auth = ChatGPTOnlyOAuthProxy(
         upstream_authorization_endpoint="https://github.com/login/oauth/authorize",
         upstream_token_endpoint="https://github.com/login/oauth/access_token",
         upstream_client_id=client_id,
