@@ -4,6 +4,8 @@ from typing import Any
 
 import httpx
 from fastmcp import FastMCP
+from fastmcp.server.auth import OAuthProxy
+from fastmcp.server.auth.providers.github import GitHubTokenVerifier
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 
 
@@ -21,10 +23,48 @@ ALLOWED_COLLECTIONS = {
     "groups", "correspondents",
 }
 
-auth = StaticTokenVerifier(
-    tokens={MCP_TOKEN: {"client_id": "familieflips", "scopes": ["paperless"]}},
-    required_scopes=["paperless"],
-)
+AUTH_MODE = os.environ.get("AUTH_MODE", "static").strip().lower()
+GITHUB_ALLOWED_USER_ID = os.environ.get("GITHUB_ALLOWED_USER_ID", "").strip()
+
+
+class OwnerOnlyGitHubTokenVerifier(GitHubTokenVerifier):
+    """Allow only the specifically configured GitHub account."""
+
+    async def verify_token(self, token: str):
+        access_token = await super().verify_token(token)
+        if access_token is None or access_token.claims.get("sub") != GITHUB_ALLOWED_USER_ID:
+            return None
+        return access_token
+
+
+if AUTH_MODE == "github":
+    client_id = os.environ.get("GITHUB_CLIENT_ID", "").strip()
+    client_secret = os.environ.get("GITHUB_CLIENT_SECRET", "")
+    signing_key = os.environ.get("OAUTH_SIGNING_KEY", "")
+    if not client_id or not client_secret or len(signing_key) < 32 or not GITHUB_ALLOWED_USER_ID:
+        raise SystemExit("GitHub OAuth requires client ID, client secret, signing key (32+ chars), and allowed user ID.")
+    auth = OAuthProxy(
+        upstream_authorization_endpoint="https://github.com/login/oauth/authorize",
+        upstream_token_endpoint="https://github.com/login/oauth/access_token",
+        upstream_client_id=client_id,
+        upstream_client_secret=client_secret,
+        token_verifier=OwnerOnlyGitHubTokenVerifier(required_scopes=["read:user"]),
+        base_url="https://mcp.familieflips.com",
+        jwt_signing_key=signing_key,
+        allowed_client_redirect_uris=[
+            "https://chatgpt.com/connector/oauth/*",
+            "https://chatgpt.com/connector_platform_oauth_redirect",
+        ],
+        require_authorization_consent=True,
+    )
+elif AUTH_MODE == "static":
+    auth = StaticTokenVerifier(
+        tokens={MCP_TOKEN: {"client_id": "familieflips", "scopes": ["paperless"]}},
+        required_scopes=["paperless"],
+    )
+else:
+    raise SystemExit("Unsupported auth_mode. Use 'static' or 'github'.")
+
 mcp = FastMCP("Paperless FamilieFlips", auth=auth)
 
 
