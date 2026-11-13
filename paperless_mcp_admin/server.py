@@ -1,8 +1,10 @@
 import base64
+import binascii
+import json
 import os
-from typing import Any
-from urllib.parse import urlsplit
 import re
+from typing import Any, Literal
+from urllib.parse import urlsplit
 
 import httpx
 from fastmcp import FastMCP
@@ -22,8 +24,12 @@ if not PAPERLESS_TOKEN or len(MCP_TOKEN) < 32:
 ALLOWED_COLLECTIONS = {
     "document_types", "storage_paths", "tags", "custom_fields",
     "workflows", "mail_accounts", "mail_rules", "users",
-    "groups", "correspondents",
+    "groups", "correspondents", "saved_views", "workflow_triggers",
+    "workflow_actions", "share_links", "share_link_bundles", "config", "documents",
 }
+
+DOCUMENTS_URL = f"{PAPERLESS_URL}/api/documents/"
+
 
 def _allowed_chatgpt_redirect(uri: str) -> bool:
     """Restrict all DCR clients to ChatGPT's documented HTTPS callbacks."""
@@ -126,21 +132,31 @@ def _url(collection: str, item_id: int | None = None) -> str:
     return f"{PAPERLESS_URL}/api/{collection}{suffix}/"
 
 
-async def _request(method: str, url: str, payload: Any = None, params: dict | None = None) -> Any:
+async def _request(
+    method: str,
+    url: str,
+    payload: Any = None,
+    params: dict | None = None,
+    *,
+    form: dict | None = None,
+    files: dict | None = None,
+) -> Any:
     async with httpx.AsyncClient(
         timeout=60,
         headers={"Authorization": f"Token {PAPERLESS_TOKEN}"},
         follow_redirects=False,
     ) as client:
-        response = await client.request(method, url, json=payload, params=params)
+        response = await client.request(
+            method, url, json=payload, params=params, data=form, files=files
+        )
         response.raise_for_status()
         if not response.content:
             return {"status": response.status_code}
         return response.json()
 
 
-def _write_blocked() -> dict | None:
-    return {"status": "blocked", "reason": "Read-only mode is enabled"} if READ_ONLY else None
+def _write_blocked() -> dict:
+    return {"status": "blocked", "reason": "Read-only mode is enabled"}
 
 
 @mcp.tool()
@@ -164,9 +180,7 @@ async def search_documents(
         params["created__date__gte"] = created_after
     if created_before:
         params["created__date__lte"] = created_before
-    data = await _request("GET", _url("documents"), params=params) if False else await _request(
-        "GET", f"{PAPERLESS_URL}/api/documents/", params=params
-    )
+    data = await _request("GET", DOCUMENTS_URL, params=params)
     return {
         "count": data.get("count", 0),
         "results": [
@@ -184,7 +198,7 @@ async def search_documents(
 @mcp.tool()
 async def get_document(document_id: int, include_content: bool = True) -> dict:
     """Get document metadata and optionally its extracted text."""
-    result = await _request("GET", f"{PAPERLESS_URL}/api/documents/{document_id}/")
+    result = await _request("GET", f"{DOCUMENTS_URL}{document_id}/")
     if not include_content:
         result.pop("content", None)
     return result
@@ -231,7 +245,7 @@ async def list_document_types(page_size: int = 200) -> dict:
 
 @mcp.tool()
 async def list_admin_objects(collection: str, page: int = 1) -> dict:
-    """List an allowed configuration collection (such as mail_rules)."""
+    """List configuration such as workflows, mail_rules, tags, users, or groups."""
     return await _request("GET", _url(collection), params={"page": max(1, page)})
 
 
@@ -241,7 +255,7 @@ async def get_admin_object(collection: str, item_id: int) -> dict:
     return await _request("GET", _url(collection, item_id))
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
 async def create_admin_object(collection: str, payload: dict) -> dict:
     """Create a configuration item when write access is enabled."""
     if READ_ONLY:
@@ -249,7 +263,7 @@ async def create_admin_object(collection: str, payload: dict) -> dict:
     return await _request("POST", _url(collection), payload=payload)
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True})
 async def change_admin_object(collection: str, item_id: int, payload: dict) -> dict:
     """Patch a configuration item when write access is enabled."""
     if READ_ONLY:
@@ -257,7 +271,124 @@ async def change_admin_object(collection: str, item_id: int, payload: dict) -> d
     return await _request("PATCH", _url(collection, item_id), payload=payload)
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True})
+async def update_document(document_id: int, changes: dict[str, Any]) -> dict:
+    """Change a document's fields, including title, tags, date, storage path,
+    custom fields, text, owner or permissions. Only sends supplied fields.
+    The tags and custom_fields fields replace the corresponding full lists.
+    """
+    if READ_ONLY:
+        return _write_blocked()
+    if not changes:
+        raise ValueError("Supply at least one document field to change.")
+    updated = await _request("PATCH", _url("documents", document_id), payload=changes)
+    updated.pop("content", None)
+    return updated
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
+async def upload_document(
+    filename: str,
+    content_b64: str,
+    metadata: dict[str, Any] | None = None,
+    document_id: int | None = None,
+) -> dict:
+    """Upload a file to Paperless. For new documents, metadata can include title,
+    created, correspondent, document_type, storage_path, tags, archive_serial_number
+    and custom_fields. Set document_id to add a file version to an existing document
+    and use version_label as the optional metadata. Returns the import task ID.
+    """
+    if READ_ONLY:
+        return _write_blocked()
+    if not filename.strip() or any(c in filename for c in ("/", "\\", "\0")):
+        raise ValueError("Supply a filename without a directory.")
+    try:
+        content = base64.b64decode(content_b64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("The document content must be valid base64.") from exc
+    if not content:
+        raise ValueError("The document file is empty.")
+
+    metadata = metadata or {}
+    if document_id is None:
+        url = DOCUMENTS_URL + "post_document/"
+        allowed_fields = {
+            "title", "created", "correspondent", "document_type", "storage_path",
+            "tags", "archive_serial_number", "custom_fields",
+        }
+    else:
+        url = _url("documents", document_id) + "update_version/"
+        allowed_fields = {"version_label"}
+    unknown_fields = metadata.keys() - allowed_fields
+    if unknown_fields:
+        raise ValueError(f"Unsupported upload fields: {', '.join(sorted(unknown_fields))}")
+
+    form = {key: value for key, value in metadata.items() if value is not None}
+    if "custom_fields" in form:
+        form["custom_fields"] = json.dumps(form["custom_fields"])
+    task = await _request("POST", url, form=form, files={"document": (filename, content)})
+    return {"task": task, "filename": filename}
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True})
+async def run_document_operation(
+    operation: Literal[
+        "bulk_edit", "delete", "reprocess", "rotate", "merge", "merge_as_versions",
+        "edit_pdf", "remove_password", "add_note", "delete_note",
+        "rename_version", "delete_version", "restore", "empty_trash",
+    ],
+    payload: dict[str, Any],
+    document_id: int | None = None,
+    version_id: int | None = None,
+    confirm: bool = False,
+) -> dict | list[dict]:
+    """Run a Paperless document operation with its API arguments. Delete moves
+    documents to trash. Restore and empty_trash require explicit document IDs.
+    Empty_trash permanently deletes those items. Without confirm, previews the operation.
+    """
+    if READ_ONLY:
+        return _write_blocked()
+
+    method = "POST"
+    params = None
+    if operation in {"restore", "empty_trash"}:
+        documents = payload.get("documents")
+        if not isinstance(documents, list) or not documents:
+            raise ValueError("Supply the document IDs in payload.documents.")
+        url = f"{PAPERLESS_URL}/api/trash/"
+        payload = {"documents": documents, "action": "restore" if operation == "restore" else "empty"}
+    elif operation in {"add_note", "delete_note", "rename_version", "delete_version"}:
+        if document_id is None:
+            raise ValueError("Supply the document ID for this operation.")
+        document_url = _url("documents", document_id)
+        if operation in {"add_note", "delete_note"}:
+            url = document_url + "notes/"
+            if operation == "delete_note":
+                note_id = payload.get("id")
+                if type(note_id) is not int or note_id < 1:
+                    raise ValueError("Supply the note ID in payload.id.")
+                method = "DELETE"
+                params = {"id": note_id}
+                payload = None
+        else:
+            if version_id is None or version_id < 1:
+                raise ValueError("Supply the version ID for this operation.")
+            url = f"{document_url}versions/{version_id}/"
+            method = "PATCH" if operation == "rename_version" else "DELETE"
+    else:
+        url = f"{DOCUMENTS_URL}{operation}/"
+
+    if not confirm:
+        return {
+            "status": "preview", "operation": operation,
+            "document_id": document_id, "version_id": version_id,
+            "document_ids": payload.get("documents") if payload else None,
+            "note_id": params["id"] if params else None,
+        }
+    return await _request(method, url, payload=payload, params=params)
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True})
 async def delete_mail_rule(item_id: int, confirmed: bool = False) -> dict:
     """Delete a mail rule only with an explicit confirmed flag and enabled writes."""
     if not confirmed:
@@ -280,7 +411,7 @@ async def paperless_admin_get(collection: str, item_id: int) -> dict:
     return await get_admin_object(collection, item_id)
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True})
 async def paperless_admin_write(
     method: str, collection: str, item_id: int | None = None,
     payload: dict | None = None, confirm: bool = False,
@@ -300,7 +431,7 @@ async def paperless_admin_write(
 @mcp.tool()
 async def paperless_admin_status() -> dict:
     """Check Paperless availability without returning document details."""
-    data = await _request("GET", f"{PAPERLESS_URL}/api/documents/", params={"page_size": 1})
+    data = await _request("GET", DOCUMENTS_URL, params={"page_size": 1})
     return {"connected": True, "document_count": data.get("count", 0), "read_only": READ_ONLY}
 
 
